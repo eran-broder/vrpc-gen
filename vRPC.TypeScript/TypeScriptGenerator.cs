@@ -1,6 +1,6 @@
 ﻿using System.Collections.ObjectModel;
 using System.Reflection;
-using System.Text;
+using System.Xml;
 using vRPC.core;
 using Vigor.Functional;
 using Vigor.Functional.Option;
@@ -11,82 +11,137 @@ namespace vRPC.TypeScript
     {
         public IEnumerable<(string fileName, string content)> Generate(Type service)
         {
-            var defaultFactory = new TypeFactory(new Dictionary<Type, TsType>());
-            var (methods, newTypes) = service.GetMethods().Aggregate((methods: Enumerable.Empty<MethodDeclaration>(), types: new HashSet<Type>()), (tuple, info) =>
-            {
-                var (newMethod, newTypes) = GenerateMethod(info, defaultFactory);
-                return (tuple.methods.Append(newMethod), tuple.types.Concat(newTypes).ToHashSet());
-            });
-            
-            var argumentMap = new Constant($"{service.Name}_arguments", $"{{{CommaJoin(methods.Select(ArgumentEntry))}}}");
+            var (methods, newTypesFromMethods) = ExtractMethods(service);
+            var (events, newTypesFromEvents) = ExtractEvents(service);
+            var allNewTypes = newTypesFromMethods.Union(newTypesFromEvents).ToList();
+            var argumentMap = new Constant($"{service.Name}_arguments", $"{{{U.CommaJoin(methods.Select(ArgumentEntry))}}}");
 
-            var newTsTypes = newTypes.Aggregate((codes: Enumerable.Empty<ICode>(), factory: defaultFactory), (tuple, type) =>
-            {
-                var res = GenerateNewType(type, tuple.factory);
-                return (tuple.codes.Concat(res.code), res.newFactory);
-            });
+            var (codes, finalFactory) = GenerateNewTypes(allNewTypes, TypeFactory.Builtins());
 
-            var @interface = new Interface(service.Name, methods, Enumerable.Empty<Field>());
+            var promisifiedMethods = methods.Select(m => m with { ReturnType = m.ReturnType.Promisify() });
+            var @interface = new Interface(service.Name, promisifiedMethods.Cast<ICode>().Concat(events));
 
-            var rttiInfo = new TypedConstant($"{service.Name}_methods", new TsType($"Array<keyof {@interface.Name}>"),
-                $"[{string.Join(",", methods.Select(m => $"'{m.Name}'"))}]");
+            var rttiInfo = new TypedConstant($"{service.Name}_methods", new TsType($"Array<coreTypes.WithoutEvents<{@interface.Name}>>"),
+                $"[{string.Join(",", methods.Where(m => m.Name != "on").Select(m => $"'{m.Name}'"))}]");
 
-            var file = new File(Enumerable.Empty<Import>(), newTsTypes.codes.Concat(new ICode[]{@interface, rttiInfo, argumentMap }), new Exports(new INamed[]{@interface, rttiInfo, argumentMap }));
+            var imports = new[] { new Import("coreTypes", "./rpcCoreTypes") };
+            var file = new File(imports.Concat(codes).Concat(new ICode[]{@interface, rttiInfo, argumentMap }), new Exports(new INamed[]{@interface, rttiInfo, argumentMap}.Concat(finalFactory.NonBuiltins)));
             var writer = new CodeWriter();
             file.Generate(writer);
             string code = writer.GetCode();
             return new[] { ($"{service.Name}_vrpc.ts", code) };
         }
 
-        private static (IEnumerable<ICode> code, TypeFactory newFactory) GenerateNewType(Type type, TypeFactory currentFactory)
+        private static (IEnumerable<Event> methods, HashSet<Type> newTypes) ExtractEvents(Type @interface)
         {
-            if (currentFactory.IsKnown(type))
-                return (Enumerable.Empty<ICode>(), currentFactory);
-
-            var fields = type.GetProperties().Select(f => new Field(f.Name, currentFactory.Map(f.PropertyType)));
-            var (subCodes, subFactory) = type.GetProperties().Select(f => f.PropertyType)
-                .Aggregate((codes: Enumerable.Empty<ICode>(), currentFactory), (tuple, subType) =>
-                {
-                    var (newCodes, newFactory) = GenerateNewType(subType, tuple.currentFactory);
-                    return (tuple.codes.Concat(newCodes), newFactory);
-                });
-            var @interface = new Interface(type.Name, Enumerable.Empty<MethodDeclaration>(), fields);
-            return (subCodes.Append(@interface), subFactory.Append(type, currentFactory.Map(type)));
+            return @interface.GetEvents().Aggregate((events: Enumerable.Empty<Event>(), types: new HashSet<Type>()), (tuple, info) =>
+            {
+                var (newMethod, newTypes) = GenerateEvent(info, TypeFactory.Builtins());
+                return (tuple.events.Append(newMethod), tuple.types.Concat(newTypes).ToHashSet());
+            });
         }
 
-        private string ArgumentEntry(MethodDeclaration method) => $"{Quote(method.Name)}: [{CommaJoin(method.args.Select(a => Quote(a.Name)))}]";
+        private static (IEnumerable<MethodDeclaration> methods, HashSet<Type> newTypes) ExtractMethods(Type @interface)
+        {
+            return @interface.GetMethods().Where(m => !m.IsSpecialName).Aggregate((methods: Enumerable.Empty<MethodDeclaration>(), types: new HashSet<Type>()), (tuple, info) =>
+            {
+                var (newMethod, newTypes) = GenerateMethod(info, TypeFactory.Builtins());
+                return (tuple.methods.Append(newMethod).ToList(), tuple.types.Concat(newTypes).ToHashSet());
+            });
+        }
 
-        private static string CommaJoin(IEnumerable<string> args) => string.Join(", ", args);
-        private static string Quote(string arg) => $"\"{arg}\"";
+        
 
-        private (MethodDeclaration method, IEnumerable<Type> unknowTypes) GenerateMethod(MethodInfo source, TypeFactory typeFactory)
+        private static (IEnumerable<ICode> code, TypeFactory newFactory) GenerateNewTypes(IEnumerable<Type> types, TypeFactory seedFactory)
+        {
+            types = types.ToList();
+            var unknownTypes = types.SelectMany(seedFactory.UnknownTypes).Distinct().ToList();
+            return unknownTypes.Aggregate(
+                (codes: Enumerable.Empty<ICode>(), currentFactory: seedFactory), (tuple, unknownType) =>
+                {
+                    var (code, subTypes, updatedFactory) = GenerateNewType(unknownType, tuple.currentFactory);
+                    var (subCodes, subFactory) = GenerateNewTypes(subTypes, updatedFactory);
+                    return (tuple.codes.Concat(subCodes).Append(code), subFactory);
+                });
+        }
+
+        private static (@ICode code, IEnumerable<Type> subTypes, TypeFactory updatedFactory) GenerateNewType(Type unknownType, TypeFactory factory)
+        {
+            var codeName = factory.Map(unknownType).Name;
+            var updatedFactory = factory.Append(unknownType, new TsType(codeName));
+
+            if (unknownType.IsClass || unknownType.IsInterface)
+            {
+                var fields = unknownType.GetProperties().Select(f =>
+                    new Field(U.LowerFirst(f.Name), factory.Map(f.PropertyType)));
+                var @interface = new Interface(codeName, fields);
+                var subTypes = unknownType.GetProperties().Select(f => f.PropertyType);
+                return (@interface, subTypes, updatedFactory);
+            }
+            else if (unknownType.IsEnum)
+            {
+                var @enum = new Enum(codeName, System.Enum.GetNames(unknownType));
+                return (@enum, Enumerable.Empty<Type>(), updatedFactory);
+            }
+            else
+            {
+                throw new Exception($"Type [{unknownType.FullName}] is not a class/Interface/Enum.");
+            }
+            
+        }
+
+        private string ArgumentEntry(MethodDeclaration method) => $"{U.Quote(method.Name)}: [{U.CommaJoin(method.args.Select(a => U.Quote(a.Name)))}]";
+
+        private static (MethodDeclaration method, IEnumerable<Type> unknowTypes) GenerateMethod(MethodInfo source, TypeFactory typeFactory)
         {
             var arguments = source.GetParameters().Select(p => new Argument(p.Name!, typeFactory.Map(p.ParameterType))).ToList();
             var declaration = new MethodDeclaration(source.Name, arguments, typeFactory.Map(source.ReturnType));
-            var unknownTypes = source.GetParameters().Append(source.ReturnParameter).Distinct().Where(p => !typeFactory.IsKnown(p.ParameterType)).Select(p => p.ParameterType);
+            var allAvailableTypes = source.GetParameters().Append(source.ReturnParameter).Select(p => p.ParameterType);
+            var unknownTypes = allAvailableTypes.SelectMany(typeFactory.UnknownTypes).Distinct();
             return (declaration, unknownTypes);
         }
 
+        private static (Event method, IEnumerable<Type> unknowTypes) GenerateEvent(EventInfo eventInfo, TypeFactory typeFactory)
+        {
+            var invokerMethod = eventInfo.EventHandlerType!.GetMethod("Invoke")!;
+            var (eventAsMethod, unknownTypes) = GenerateMethod(invokerMethod, typeFactory);
+            var tsEvent = new Event(eventInfo.Name, eventAsMethod.args);
+            return (tsEvent, unknownTypes);
+        }
+    }
+
+    static class U
+    {
+        public static string CommaJoin(IEnumerable<string> args) => string.Join(", ", args);
+        public static string Quote(string arg) => $"\"{arg}\"";
+
+        public static string LowerFirst(string argName) => $"{argName[0].ToString().ToLower()}{argName[1..]}";
     }
 
     class TypeFactory
     {
-        private readonly Dictionary<Type, TsType> _additionalTypes;
+        private readonly Dictionary<Type, TsType> _knownTypes;
 
-        private Dictionary<Type, TsType> builtins = new()
+        private static Dictionary<Type, TsType> builtins = new()
         {
             {typeof(int), new TsType("number")},
             {typeof(long), new TsType("number") },
             {typeof(string), new TsType("string") },
+            {typeof(void), new TsType("void") },
+            {typeof(List<>), new TsType("Array")},
+            {typeof(object), new TsType("any")}
         };
 
-        public TypeFactory(): this(new Dictionary<Type, TsType>())
+
+        private TypeFactory(): this(new Dictionary<Type, TsType>())
         {
         }
 
+        public static TypeFactory Builtins() => new(builtins);
+
         public TypeFactory(Dictionary<Type, TsType> additionalTypes)
         {
-            _additionalTypes = additionalTypes;
+            _knownTypes = additionalTypes;
         }
 
         public TypeFactory Append(Type type, TsType tsType)
@@ -95,10 +150,42 @@ namespace vRPC.TypeScript
         }
 
         public TypeFactory Extend(IDictionary<Type, TsType> newTypes) => 
-            new(_additionalTypes.Concat(newTypes).ToDictionary(pair => pair.Key, pair => pair.Value));
+            new(_knownTypes.Concat(newTypes).ToDictionary(pair => pair.Key, pair => pair.Value));
+        public IEnumerable<Type> UnknownTypes(Type type)
+        {
+            if (type.IsGenericType && ! type.GetGenericArguments().First().IsGenericTypeParameter)
+                return UnknownTypes(type.GetGenericTypeDefinition())
+                    .Concat(UnknownTypes(type.GetGenericArguments().First()));
+            else
+            {
+                return _knownTypes.ContainsKey(type) ? Enumerable.Empty<Type>() : new[] { type };
+            }
+                
+        }
 
-        public bool IsKnown(Type type) => builtins.ContainsKey(type) || _additionalTypes.ContainsKey(type);
-        public TsType Map(Type type) => builtins.GetOrNone(type).Match(tsType => tsType, () => new TsType(type.Name));
+        public IEnumerable<TsType> NonBuiltins => _knownTypes.Where(t => !builtins.ContainsKey(t.Key)).AsDict().Values;
+        public TsType Map(Type type) => builtins.GetOrNone(type).Match(tsType => tsType, () => MapNonBuiltin(type));
+
+
+        private TsType MapGeneric(Type type)
+        {
+            var baseType = type.GetGenericTypeDefinition();
+            var genericArgument = type.GenericTypeArguments.First();
+            var res = Map(baseType).AsGeneric(Map(genericArgument));
+            return res;
+        }
+
+        private TsType MapNonBuiltin(Type type)
+        {
+            if(type.IsGenericType)
+            {
+                return MapGeneric(type);
+            }
+            else
+            {
+                return new TsType(type.Name);
+            }
+        }
     }
 
     interface INamed
@@ -109,17 +196,21 @@ namespace vRPC.TypeScript
     {
         void Generate(CodeWriter writer);
     }
-    record File(IEnumerable<Import> Imports, IEnumerable<ICode> Contents, Exports Exports): ICode
+    record File(IEnumerable<ICode> Contents, Exports Exports): ICode
     {
         public void Generate(CodeWriter writer)
         {
-            Imports.ForEach(i => i.Generate(writer));
             Contents.ForEach(i => i.Generate(writer));
             Exports.Generate(writer);
         }
     }
 
     record TsType(string Name): INamed;
+    static class TsTypeExtensions
+    {
+        public static TsType Promisify(this TsType type) => new TsType($"Promise<{type.Name}>");
+        public static TsType AsGeneric(this TsType type, TsType argument) => new TsType($"{type.Name}<{argument.Name}>");
+    }
     record Import(string Name, string From): ICode
     {
         public void Generate(CodeWriter writer)
@@ -128,7 +219,7 @@ namespace vRPC.TypeScript
         }
     }
 
-    record Interface(string Name, IEnumerable<MethodDeclaration> Methods, IEnumerable<Field> Fields) : ICode, INamed
+    record Interface(string Name, IEnumerable<ICode> Segments) : ICode, INamed
     {
         public void Generate(CodeWriter writer)
         {
@@ -142,8 +233,7 @@ namespace vRPC.TypeScript
                     codeWriter.NewLine();
                 });
                 
-                WriteStuff(Methods);
-                WriteStuff(Fields);
+                WriteStuff(Segments);
             });
         }
     }
@@ -195,6 +285,16 @@ namespace vRPC.TypeScript
         }
     }
 
+    internal record Event(string Name, IList<Argument> args) : ICode
+    {
+        public void Generate(CodeWriter writer)
+        {
+            //on(eventName: "click", callback: (a: number, b: number)=>void): void;
+            
+            writer.Write($"on(eventName:{U.Quote(Name)}, callback: ({U.CommaJoin(args.Select(a => $"{a.Name}: {a.Type.Name}"))}) => void): void;");
+        }
+    }
+
     record Constant(string Name, string Expression): ICode, INamed
     {
         public void Generate(CodeWriter writer)
@@ -220,43 +320,15 @@ namespace vRPC.TypeScript
         }
     }
 
-    class CodeWriter
+    internal record Enum(string Name, IEnumerable<string> EnumFields) : ICode, INamed
     {
-        private StringBuilder _code = new();
-        private int _indent = 0;
-
-        public void Line(string content)
+        public void Generate(CodeWriter writer)
         {
-            Write(content);
-            NewLine();
+            writer.Write($"enum {Name}");
+            writer.Block((w) =>
+            {
+                EnumFields.ForEach(f => w.Line($"{f},"));
+            });
         }
-        public void Write(string content)
-        {
-            _code.Append(content);
-        }
-
-        public void Block(Action<CodeWriter> blockGeneration)
-        {
-            Line("{");
-            _indent++;
-            WriteIndent();
-            blockGeneration(this);
-            _indent--;
-            Line("}");
-        }
-
-        private void WriteIndent()
-        {
-            Write(new string(' ', _indent*4));
-        }
-
-        public void Block(Func<string> blockGeneration)
-        {
-            Block(writer => writer.Write(blockGeneration()));
-        }
-
-        public void NewLine() => Write("\r\n");
-
-        public string GetCode() => _code.ToString();
     }
 };
