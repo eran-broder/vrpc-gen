@@ -11,6 +11,11 @@ PerformGeneration(@"C:\Users\broder\source\repos\Vigor\Vigor.Rpc\bin\Debug\net6.
                   @"C:\vim\vrpc\src", 
                    "vRPC.TypeScript.TypeScriptGenerator, vRPC.TypeScript");
 
+PerformGeneration(@"C:\Users\broder\source\repos\Vigor\Vigor.Inspector.Interactive\bin\Debug\net6.0-windows\Vigor.Inspector.Interactive.dll",
+    "Vigor.Inspector.Interactive.RemoteElementHighlighter",
+    @"C:\vim\vrpc\src",
+    "vRPC.TypeScript.TypeScriptGenerator, vRPC.TypeScript");
+
 void PerformGeneration(string pathOfInput, string nameOfClass, string pathOfOutput, string flavor)
 {
     var type = GetTypeToReflect(pathOfInput, nameOfClass);

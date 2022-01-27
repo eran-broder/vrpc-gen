@@ -13,7 +13,7 @@ namespace vRPC.Common
 
         public static void NotNull<T>(T? value, string msg = "")
         {
-            Assert(value != null);
+            Assert(value != null, msg);
         }
     }
 }

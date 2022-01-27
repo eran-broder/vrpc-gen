@@ -43,14 +43,13 @@ namespace vRPC.TypeScript
 
         private static (IEnumerable<MethodDeclaration> methods, HashSet<Type> newTypes) ExtractMethods(Type @interface)
         {
-            return @interface.GetMethods().Where(m => !m.IsSpecialName).Aggregate((methods: Enumerable.Empty<MethodDeclaration>(), types: new HashSet<Type>()), (tuple, info) =>
+            var methodsToReflect = @interface.GetMethods(BindingFlags.DeclaredOnly | BindingFlags.Public | BindingFlags.Instance).ToList();
+            return methodsToReflect.Where(m => !m.IsSpecialName).Aggregate((methods: Enumerable.Empty<MethodDeclaration>(), types: new HashSet<Type>()), (tuple, info) =>
             {
                 var (newMethod, newTypes) = GenerateMethod(info, TypeFactory.Builtins());
                 return (tuple.methods.Append(newMethod).ToList(), tuple.types.Concat(newTypes).ToHashSet());
             });
         }
-
-        
 
         private static (IEnumerable<ICode> code, TypeFactory newFactory) GenerateNewTypes(IEnumerable<Type> types, TypeFactory seedFactory)
         {
@@ -126,10 +125,11 @@ namespace vRPC.TypeScript
         {
             {typeof(int), new TsType("number")},
             {typeof(long), new TsType("number") },
-            {typeof(string), new TsType("string") },
+            { typeof(string), new TsType("string") },
             {typeof(void), new TsType("void") },
             {typeof(List<>), new TsType("Array")},
-            {typeof(object), new TsType("any")}
+            { typeof(bool), new TsType("bool") },
+            { typeof(object), new TsType("any")}
         };
 
 
@@ -324,11 +324,19 @@ namespace vRPC.TypeScript
     {
         public void Generate(CodeWriter writer)
         {
-            writer.Write($"enum {Name}");
-            writer.Block((w) =>
-            {
-                EnumFields.ForEach(f => w.Line($"{f},"));
-            });
+
+            writer.Line($@"//TODO: there is a real issue with converting a string back to a literal/enum when object is in an array");
+            writer.Line($"//type {Name} = {string.Join("|", EnumFields.Select(f => U.Quote(f)))};");
+            writer.Line($@"//TODO: It is with a heavy heart that I use 'any'. will come to it later");
+            writer.Line($"type {Name} = any;");
+            writer.NewLine();
+            //TODO: literal? enum?
+            //writer.Line($"type {Name} = {string.Join("|", EnumFields.Select(f => U.Quote(f)))};");
+            //writer.Write($"enum {Name}");
+            //writer.Block((w) =>
+            //{
+            //    EnumFields.ForEach(f => w.Line($"{f},"));
+            //});
         }
     }
 };
